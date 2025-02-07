@@ -982,7 +982,6 @@ class WattTimeMaps(WattTimeBase):
         rsp.raise_for_status()
         return rsp.json()
 
-
 class Recalculator:
     """A class to manage and update charging schedules over time.
 
@@ -993,6 +992,10 @@ class Recalculator:
         all_schedules (list): List of tuples containing (schedule, time_context) pairs
         total_time_required (int): Total charging time needed in minutes
         end_time (datetime): Final deadline for the charging schedule
+        charge_per_interval (list): List of charging durations per interval
+        is_contiguous (bool): Flag indicating if charging must be contiguous
+        sleep_delay(bool): Flag indicating if next query time must be delayed
+        contiguity_values_dict (dict): Dictionary storing contiguity-related values
     """
 
     def __init__(
@@ -1000,7 +1003,8 @@ class Recalculator:
         initial_schedule: pd.DataFrame,
         start_time: datetime,
         end_time: datetime,
-        total_time_required: int
+        total_time_required: int,
+        charge_per_interval: None
     ) -> None:
         """Initialize the Recalculator with an initial schedule.
 
@@ -1009,16 +1013,27 @@ class Recalculator:
             start_time (datetime): Start time for the schedule
             end_time (datetime): End time for the schedule
             total_time_required (int): Total charging time needed in minutes
+            charge_per_interval (list): List of charging durations per interval
         """
-        self.all_schedules = [(initial_schedule, (start_time, end_time))]  # (schedule, ctx)
+        self.all_schedules = [(initial_schedule, (start_time, end_time))]
         self.total_time_required = total_time_required
         self.end_time = end_time
+        self.charge_per_interval = charge_per_interval
+        self.is_contiguous = charge_per_interval is not None
+        self.sleep_delay = False
+        self.contiguity_values_dict = {
+                    "delay_usage_window_start": None,
+                    "delay_in_minutes": None,
+                    "delay_in_intervals": None,
+                    "remaining_time_required": None,
+                    "num_segments_complete": None
+                }
 
     def get_remaining_time_required(self, next_query_time: datetime):
         """Calculate remaining charging time needed at a given query time.
 
         Args:
-            next_query_time (datetime): Time at which to calculate remaining time
+            next_query_time (datetime): Time from which to calculate remaining time
 
         Returns:
             int: Remaining charging time required in minutes
@@ -1026,44 +1041,68 @@ class Recalculator:
         if len(self.all_schedules) == 0:
             return self.total_time_required
 
-        # If there are previously produced schedules, assume we followed each schedule until getting a new one
         combined_schedule = self.get_combined_schedule()
 
-        # Calculate remaining time required
         usage_in_minutes = int(
-            combined_schedule[combined_schedule.index < next_query_time]["usage"].sum()
+            combined_schedule.loc[:next_query_time]["usage"].sum()
         )
         return self.total_time_required - usage_in_minutes
     
-    def set_last_schedule_end_time(self, new_schedule_start_time: datetime):
+    def set_last_schedule_end_time(self, next_query_time: datetime):
         """Update the end time of the most recent schedule.
 
         Args:
-            new_schedule_start_time (datetime): New end time for the last schedule
+            next_query_time (datetime): New end time for the last schedule
+
+        Raises:
+            AssertionError: If new end time is before start time
         """
-        # If there a previously produced schedule, assume we followed that schedule until getting the new one
         if len(self.all_schedules) > 0:
-            # Set end time of last ctx
             schedule, ctx = self.all_schedules[-1]
-            print(ctx[0])
-            print(new_schedule_start_time)
-            self.all_schedules[-1] = (schedule, (ctx[0], new_schedule_start_time))
-            assert ctx[0] < new_schedule_start_time
+            self.all_schedules[-1] = (schedule, (ctx[0], next_query_time))
+            assert ctx[0] < next_query_time
 
     def update_charging_schedule(
             self,
-            new_schedule: pd.DataFrame,
-            new_schedule_start_time: datetime
+            next_query_time: datetime,
+            next_new_schedule_start_time = None,
+            new_schedule: Optional[pd.DataFrame] = None
         ):
-        """Add a new charging schedule to the list of schedules.
+        """Add a new charging schedule and update contiguity values.
 
         Args:
-            new_schedule (pd.DataFrame): New charging schedule to add
-            new_schedule_start_time (datetime): Start time for the new schedule
+            next_query_time (datetime): Current query time
+            next_new_schedule_start_time (datetime, optional): Start time for next schedule
+            new_schedule (pd.DataFrame, optional): New charging schedule to add
         """
-        self.set_last_schedule_end_time(new_schedule_start_time)
-        self.all_schedules.append((new_schedule, (new_schedule_start_time, self.end_time)))
-                                               
+        if new_schedule is not None:
+            self.set_last_schedule_end_time(next_query_time)
+            self.all_schedules.append((new_schedule, (next_query_time, self.end_time)))
+            if self.is_contiguous:
+                self.sleep_delay = self.check_if_contiguity_sleep_required(new_schedule, next_new_schedule_start_time)
+        else:
+            if self.is_contiguous:
+                self.sleep_delay = self.check_if_contiguity_sleep_required(self.all_schedules[0][0], next_new_schedule_start_time)
+        if self.is_contiguous is True:
+            if self.sleep_delay is True:
+                s = self.get_combined_schedule().loc[next_new_schedule_start_time:]['usage'] == 0
+                delay_time = self.end_time if s[s == True].empty == True else s[s == True].index.min()
+                self.contiguity_values_dict = {
+                    "delay_usage_window_start": delay_time,
+                    "delay_in_minutes": len(s[s == False]) * 5,
+                    "delay_in_intervals": len(s[s == False]),
+                    "remaining_time_required": self.get_remaining_time_required(delay_time)
+                    }
+                self.contiguity_values_dict["num_segments_complete"] = self.number_segments_complete(next_query_time=self.contiguity_values_dict["delay_usage_window_start"])
+            else:
+                self.contiguity_values_dict = {
+                    "delay_usage_window_start": None,
+                    "delay_in_minutes": None,
+                    "delay_in_intervals": None,
+                    "remaining_time_required": self.get_remaining_time_required(next_query_time),
+                    "num_segments_complete": self.number_segments_complete(next_query_time=next_query_time)
+                }
+
     def get_combined_schedule(self, end_time: datetime = None) -> pd.DataFrame:
         """Combine all schedules into a single DataFrame.
 
@@ -1079,23 +1118,50 @@ class Recalculator:
         combined_schedule = pd.concat(schedule_segments)
 
         if end_time:
-            # Only keep segments that complete before end_time
-            last_segment_start_time = end_time + timedelta(minutes=OPT_INTERVAL)
-            combined_schedule = combined_schedule[
-                combined_schedule.index <= last_segment_start_time
-            ]
+            last_segment_start_time = end_time
+            combined_schedule = combined_schedule.loc[:last_segment_start_time]
 
         return combined_schedule
 
+    def check_if_contiguity_sleep_required(self, usage_plan, next_query_time):
+        """Check if charging needs to be paused for contiguity.
+
+        Args:
+            usage_plan (pd.DataFrame): Planned charging schedule
+            next_query_time (datetime): Time of next schedule update
+
+        Returns:
+            bool: True if charging needs to be paused
+        """
+        return bool(usage_plan.loc[next_query_time - timedelta(minutes=5)]['usage'] > 0)
+    
+    def number_segments_complete(self, next_query_time: datetime = None):
+        """Calculate number of completed charging segments.
+
+        Args:
+            next_query_time (datetime, optional): Time to check completion status
+
+        Returns:
+            int: Number of completed charging segments
+        """
+        combined_schedule = self.get_combined_schedule()
+        completed_schedule = combined_schedule.loc[:next_query_time]
+        charging_indicator = completed_schedule["usage"].astype(bool).sum()
+        return bisect.bisect_right(
+            list(accumulate(self.charge_per_interval)), 
+            (charging_indicator * 5)
+            )
+  
 class RequerySimulator:
     def __init__(self, 
                  moers_list,
                  requery_dates,
                  region="CAISO_NORTH",
-                 window_start=datetime(2025, 1, 1, hour=20, second=1, tzinfo=UTC),
+                 window_start=datetime(2025, 1, 1, hour=21, second=1, tzinfo=UTC),
                  window_end=datetime(2025, 1, 2, hour=8, second=1, tzinfo=UTC),
                  usage_time_required_minutes=240,
-                 usage_power_kw=2):
+                 usage_power_kw=2,
+                 charge_per_interval=None):
         self.moers_list = moers_list
         self.requery_dates = requery_dates
         self.region = region
@@ -1103,6 +1169,7 @@ class RequerySimulator:
         self.window_end = window_end
         self.usage_time_required_minutes = usage_time_required_minutes
         self.usage_power_kw = usage_power_kw
+        self.charge_per_interval = charge_per_interval
         
         self.username = os.getenv("WATTTIME_USER")
         self.password = os.getenv("WATTTIME_PASSWORD")
@@ -1115,7 +1182,7 @@ class RequerySimulator:
             usage_window_end=self.window_end,
             usage_time_required_minutes=self.usage_time_required_minutes,
             usage_power_kw=self.usage_power_kw,
-            charge_per_interval=None,
+            charge_per_interval=self.charge_per_interval,
             optimization_method="simple",
             moer_data_override=self.moers_list[0][["point_time","value"]]
         )
@@ -1126,8 +1193,13 @@ class RequerySimulator:
             initial_schedule=initial_plan,
             start_time=self.window_start,
             end_time=self.window_end,
-            total_time_required=self.usage_time_required_minutes
+            total_time_required=self.usage_time_required_minutes,
+            charge_per_interval=self.charge_per_interval
         )
+
+        # check to see the status of my segments to know if I should requery at all
+        # if I do need to requery, then I need time required + segments remaining
+        # if I don't then I store the state of my recalculator as is
         
         for i, new_window_start in enumerate(self.requery_dates[1:], 1):
             print(i)
@@ -1138,133 +1210,14 @@ class RequerySimulator:
                 usage_window_end=self.window_end,
                 usage_time_required_minutes=new_time_required,
                 usage_power_kw=self.usage_power_kw,
-                charge_per_interval=None,
+                charge_per_interval=self.charge_per_interval,
                 optimization_method="simple",
                 moer_data_override=self.moers_list[i][["point_time","value"]]
             )
             recalculator.update_charging_schedule(
                 new_schedule=next_plan,
-                new_schedule_start_time=new_window_start
+                next_query_time=new_window_start,
+                next_new_schedule_start_time = None
             )
             
         return recalculator
-
-
-class RecalculatingWattTimeOptimizerWithContiguity(RecalculatingWattTimeOptimizer):
-    def __init__(
-        self,
-        watttime_username: str,
-        watttime_password: str,
-        region: str,
-        usage_time_required_minutes: float,
-        usage_power_kw: Union[int, float, pd.DataFrame],
-        optimization_method: Optional[
-            Literal["baseline", "simple", "sophisticated", "auto"]
-        ],
-        charge_per_interval: list = [],
-    ):
-        self.all_charge_per_interval = charge_per_interval
-        super().__init__(
-            watttime_username,
-            watttime_password,
-            region,
-            usage_time_required_minutes,
-            usage_power_kw,
-            optimization_method,
-        )
-
-    def get_new_schedule(
-        self,
-        new_start_time: datetime,
-        new_end_time: datetime,
-        curr_fcst_data: pd.DataFrame = None,
-    ) -> pd.DataFrame:
-        if len(self.all_schedules) == 0:
-            # If no existing schedules, then generate as normal
-            new_schedule, _ = self._get_new_schedule(
-                new_start_time,
-                new_end_time,
-                curr_fcst_data,
-                self.all_charge_per_interval,
-            )
-            self.all_schedules.append((new_schedule, (new_start_time, new_end_time)))
-            return new_schedule
-
-        # Get the schedule that we should previously have followed
-        curr_combined_schedule = self.get_combined_schedule(new_end_time)
-
-        # Get num charging intervals completed so far
-        completed_schedule = curr_combined_schedule[
-            curr_combined_schedule.index < new_start_time
-        ]
-        charging_indicator = (
-            completed_schedule["usage"].apply(lambda x: 1 if x > 0 else 0).sum()
-        )
-        num_charging_segments_complete = bisect.bisect_right(
-            list(accumulate(self.all_charge_per_interval)), charging_indicator * 5
-        )
-
-        # Get the current status
-        curr_segment = curr_combined_schedule[
-            curr_combined_schedule.index <= new_start_time
-        ].iloc[-1]
-        if curr_segment["usage"] > 0:
-            upcoming_segments = curr_combined_schedule[
-                curr_combined_schedule.index > new_start_time
-            ]
-            upcoming_no_charge_times = upcoming_segments[
-                upcoming_segments["usage"] == 0
-            ]
-
-            # if we charge for the remaining time, return the existing schedule (starting at new_start_time)
-            if upcoming_no_charge_times.empty:
-                return curr_combined_schedule[
-                    curr_combined_schedule.index >= new_start_time
-                ]
-
-            next_unplug_time = upcoming_no_charge_times.index[0]
-            next_unplug_time = next_unplug_time.to_pydatetime()
-
-            # Get the section of old schedule to follow
-            remaining_old_schedule = curr_combined_schedule[
-                curr_combined_schedule.index < next_unplug_time
-            ]
-            remaining_old_schedule = remaining_old_schedule[
-                remaining_old_schedule.index >= new_start_time
-            ]
-
-            # Update completed segments to reflect portion of old schedule
-            additional_charge_segments = (
-                remaining_old_schedule["usage"].apply(lambda x: 1 if x > 0 else 0).sum()
-            )
-            num_charging_segments_complete = bisect.bisect_right(
-                list(accumulate(self.all_charge_per_interval)),
-                (charging_indicator + additional_charge_segments) * 5,
-            )
-
-            # Get schedule for after this segment completes
-            new_schedule, ctx = self._get_new_schedule(
-                next_unplug_time,
-                new_end_time,
-                curr_fcst_data,
-                self.all_charge_per_interval[num_charging_segments_complete:],
-            )
-
-            # Construct the schedule from start_time
-            if remaining_old_schedule is not None:
-                new_schedule = pd.concat([remaining_old_schedule, new_schedule])
-
-            ctx = (new_schedule.index[0], ctx[1])
-        else:
-            # If not in segment, generate a schedule starting at new_start_time
-            new_schedule, ctx = self._get_new_schedule(
-                new_start_time,
-                new_end_time,
-                curr_fcst_data,
-                self.all_charge_per_interval[num_charging_segments_complete:],
-            )
-
-        # Update last schedule, add new schedule
-        self._set_last_schedule_end_time(new_start_time)
-        self.all_schedules.append((new_schedule, ctx))
-        return new_schedule
