@@ -100,6 +100,7 @@ TZ_DICTIONARY = {
     "WACM": "America/Denver",
     "WALC": "America/Phoenix",
     "WAUW": "America/Denver",
+    "NL": "Europe/Amsterdam"
 }
 
 def sanitize_time_needed(x,y):
